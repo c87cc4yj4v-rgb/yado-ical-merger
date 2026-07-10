@@ -1,0 +1,8 @@
+name = "my-site-controller"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# 予約サイトの各カレンダーURLは、暗号化された「シークレット」として登録します（このファイルには書きません）。
+# 登録方法は教材本編の「A-3」または「B-4」を参照してください。
+# 必要なシークレット名:
+#   AIRBNB_ICAL_URL / BOOKING_ICAL_URL / AGODA_ICAL_URL / GOOGLE_ICAL_URL
