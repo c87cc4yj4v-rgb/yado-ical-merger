@@ -1,5 +1,5 @@
 name = "my-site-controller"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2026-07-01"
 
 # 予約サイトの各カレンダーURLは、暗号化された「シークレット」として登録します（このファイルには書きません）。
