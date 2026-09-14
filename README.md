@@ -21,8 +21,9 @@ Cline・Claude Code・CursorなどのAIエージェントに、このリポジ�
 
 ## 構成
 
-- `src/index.js` — 中継マージャー本体（各カレンダーを取得→宿泊日をマージ→1本のiCalとして配信）
+- `index.js` — 中継マージャー本体（各カレンダーを取得→宿泊日をマージ→1本のiCalとして配信）
 - `wrangler.toml` — Cloudflare Workersの設定ファイル
+- v1.1 (2026-09): 予約サイトからの取得に失敗したとき、前回成功した分（KV: `ICAL_CACHE`）を使うようにしました。応答ヘッダー `X-Merger-Sources` で各サイトの状態（live / cached / stale / missing）が見えます。KVが未設定でも v1.0 と同じ動きで動きます。すでにお使いの方の更新手順は教材本編の第5章をご覧ください
 
 ## 免責事項
 

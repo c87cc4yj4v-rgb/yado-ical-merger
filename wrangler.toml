@@ -6,3 +6,9 @@ compatibility_date = "2026-07-01"
 # 登録方法は教材本編の「A-3」または「B-4」を参照してください。
 # 必要なシークレット名:
 #   AIRBNB_ICAL_URL / BOOKING_ICAL_URL / AGODA_ICAL_URL / GOOGLE_ICAL_URL
+
+# v1.1 (2026-09): 前回成功分の保管場所（KV）。Deploy to Cloudflare ボタンが自動で作成します。
+# 手動でデプロイする場合は、Cloudflare の Workers & Pages → KV で名前空間を1つ作り、
+# その ID をここに書くか、Worker の Settings → Bindings で「ICAL_CACHE」として結び付けてください。
+[[kv_namespaces]]
+binding = "ICAL_CACHE"
