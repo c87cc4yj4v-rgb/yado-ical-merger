@@ -2,6 +2,7 @@
 // v1.1 (2026-09): 予約サイトからの取得に失敗したとき、前回成功した分（KV: ICAL_CACHE）を使うようにしました。
 // v1.1.1 (2026-09-26): 取得失敗時のログに iCal URL を丸ごと出さないようにしました（伏せ字）。
 // v1.2 (2026-09-26): 前回と同じ内容なら保管庫（KV）に書き込まないようにしました（KV無料枠の書き込み回数の節約）。
+// v1.3 (2026-09-26): 各サイトの取得状況を、配信する yado.ics の先頭にも X-MERGER-SOURCES 行として書くようにしました（メモ帳で開くだけで確認できる。読み方は X-MERGER-NOTE 行）。
 //   6時間に1回は同じ内容でも書き直して「最後に取得できた時刻」を新しくします。
 // 結合ロジック・出力形式・4つのカレンダーURL（シークレット）は v1.0 と同じです。
 // KV が未設定でも動きます（その場合は v1.0 と同じ「失敗したサイトは空扱い」）。
@@ -45,8 +46,8 @@ export default {
       }
 
       const blocks = generateMergedBlocks(blockedDates);
-      const responseIcs = buildIcsFile(blocks);
       const sourcesHeader = results.map((r) => `${r.name}=${r.status}`).join(", ");
+      const responseIcs = buildIcsFile(blocks, sourcesHeader); // v1.3: 取得状況を .ics の先頭にも書く
 
       return new Response(responseIcs, {
         headers: {
@@ -75,7 +76,7 @@ async function fetchWithFallback(source, env, ctx) {
   let liveText = null;
   let failReason = "";
   try {
-    const res = await fetch(url, { headers: { "User-Agent": "Yado-Cal-Merger/1.2" } });
+    const res = await fetch(url, { headers: { "User-Agent": "Yado-Cal-Merger/1.3" } });
     if (!res.ok) {
       failReason = `HTTP ${res.status} ${res.statusText}`;
     } else {
@@ -249,7 +250,29 @@ function generateMergedBlocks(datesSet) {
   return blocks;
 }
 
-function buildIcsFile(blocks) {
+// iCalendar の1行は75オクテット以内という決まりなので、長い行は「改行＋先頭スペース」で折り返す
+// （読む側は折り返しを元に戻して読む）。日本語の文字の途中で切らない。
+function foldLine(line) {
+  const enc = new TextEncoder();
+  const out = [];
+  let cur = "";
+  let curBytes = 0;
+  for (const ch of line) {
+    const b = enc.encode(ch).length;
+    const limit = out.length === 0 ? 75 : 74; // 折り返し行は先頭スペース1つぶん短い
+    if (curBytes + b > limit) {
+      out.push(cur);
+      cur = "";
+      curBytes = 0;
+    }
+    cur += ch;
+    curBytes += b;
+  }
+  if (cur.length) out.push(cur);
+  return out.map((s, i) => (i === 0 ? s : " " + s));
+}
+
+function buildIcsFile(blocks, sourcesHeader) {
   const lines = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -257,6 +280,11 @@ function buildIcsFile(blocks) {
     "CALSCALE:GREGORIAN",
     "METHOD:PUBLISH",
   ];
+  // v1.3: 各サイトの取得状況を .ics の先頭にも書く（メモ帳で開くだけで確認できる）。
+  // 「X-」で始まる行は iCalendar の独自項目で、予約サイトやカレンダーアプリは読み飛ばす決まり。
+  lines.push("X-MERGER-VERSION:1.3");
+  lines.push(...foldLine(`X-MERGER-SOURCES:${sourcesHeader || ""}`));
+  lines.push(...foldLine("X-MERGER-NOTE:各サイトの取得状況です。live=いま取得できた／cached(3h)=3時間前の前回分を使用中（そのサイトが一時的に返事をしていない）／stale(9d)=9日前の前回分を使用中（7日以上取れていない。URLが古くなったかも）／missing=前回分もない"));
   const nowStr = new Date().toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
   blocks.forEach((block, index) => {
     lines.push("BEGIN:VEVENT");
