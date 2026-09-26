@@ -1,11 +1,14 @@
 // yado-ical-merger: サイトコントローラー中継マージャー (JavaScript版)
 // v1.1 (2026-09): 予約サイトからの取得に失敗したとき、前回成功した分（KV: ICAL_CACHE）を使うようにしました。
 // v1.1.1 (2026-09-26): 取得失敗時のログに iCal URL を丸ごと出さないようにしました（伏せ字）。
+// v1.2 (2026-09-26): 前回と同じ内容なら保管庫（KV）に書き込まないようにしました（KV無料枠の書き込み回数の節約）。
+//   6時間に1回は同じ内容でも書き直して「最後に取得できた時刻」を新しくします。
 // 結合ロジック・出力形式・4つのカレンダーURL（シークレット）は v1.0 と同じです。
 // KV が未設定でも動きます（その場合は v1.0 と同じ「失敗したサイトは空扱い」）。
 
 const CACHE_PREFIX = "ical:";
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // 7日より古い前回分は「stale」と記録（それでも使う）
+const REWRITE_AFTER_MS = 6 * 60 * 60 * 1000; // v1.2: 内容が同じでも、前回の保存から6時間たっていたら書き直す（fetchedAt を新しくするため）
 
 // v1.1.1 (2026-09-26): ログに iCal URL を丸ごと出さない。URL は「宿の鍵」なので、
 // ログのスクショをAIに貼っても鍵が渡らないよう、ホスト名と末尾4文字だけ残して伏せ字にする。
@@ -72,7 +75,7 @@ async function fetchWithFallback(source, env, ctx) {
   let liveText = null;
   let failReason = "";
   try {
-    const res = await fetch(url, { headers: { "User-Agent": "Yado-Cal-Merger/1.1" } });
+    const res = await fetch(url, { headers: { "User-Agent": "Yado-Cal-Merger/1.2" } });
     if (!res.ok) {
       failReason = `HTTP ${res.status} ${res.statusText}`;
     } else {
@@ -89,9 +92,25 @@ async function fetchWithFallback(source, env, ctx) {
 
   if (liveText !== null) {
     if (kv) {
-      const record = JSON.stringify({ fetchedAt: Date.now(), text: liveText });
-      const put = kv.put(key, record).catch((e) => console.error(`[${name}] KV put failed:`, e));
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put); else await put;
+      // v1.2: 前回と同じ内容なら書き込まない（KV の無料枠は書き込みが1日1,000回。読み取りは10万回なので、読んで比べる分は問題にならない）。
+      // ただし前回の保存から REWRITE_AFTER_MS 以上たっていたら、同じ内容でも書き直して fetchedAt を新しくする
+      // （失敗時に出す cached(<age>) / stale(<age>) の年齢が、実際の「最後に取得できた時刻」から大きくずれないように）。
+      const save = (async () => {
+        let prevText = null, prevAt = 0;
+        try {
+          const prev = await kv.get(key);
+          if (prev) {
+            const rec = JSON.parse(prev);
+            prevText = rec && typeof rec.text === "string" ? rec.text : null;
+            prevAt = (rec && rec.fetchedAt) || 0;
+          }
+        } catch (e) {
+          // 前回分が読めなくても、保存はする
+        }
+        if (prevText === liveText && Date.now() - prevAt < REWRITE_AFTER_MS) return; // 同じ内容・保存も新しい → 書かない
+        await kv.put(key, JSON.stringify({ fetchedAt: Date.now(), text: liveText }));
+      })().catch((e) => console.error(`[${name}] KV put failed:`, e));
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(save); else await save;
     }
     return { name, text: liveText, status: "live" };
   }
