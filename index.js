@@ -1,10 +1,23 @@
 // yado-ical-merger: サイトコントローラー中継マージャー (JavaScript版)
 // v1.1 (2026-09): 予約サイトからの取得に失敗したとき、前回成功した分（KV: ICAL_CACHE）を使うようにしました。
+// v1.1.1 (2026-09-26): 取得失敗時のログに iCal URL を丸ごと出さないようにしました（伏せ字）。
 // 結合ロジック・出力形式・4つのカレンダーURL（シークレット）は v1.0 と同じです。
 // KV が未設定でも動きます（その場合は v1.0 と同じ「失敗したサイトは空扱い」）。
 
 const CACHE_PREFIX = "ical:";
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // 7日より古い前回分は「stale」と記録（それでも使う）
+
+// v1.1.1 (2026-09-26): ログに iCal URL を丸ごと出さない。URL は「宿の鍵」なので、
+// ログのスクショをAIに貼っても鍵が渡らないよう、ホスト名と末尾4文字だけ残して伏せ字にする。
+function maskUrl(url) {
+  try {
+    const u = new URL(String(url));
+    const tail = u.pathname.length + u.search.length > 4 ? String(u.pathname + u.search).slice(-4) : "";
+    return `${u.origin}/…${tail}`;
+  } catch {
+    return "(invalid url)";
+  }
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -84,7 +97,7 @@ async function fetchWithFallback(source, env, ctx) {
   }
 
   // 取得失敗 → 前回成功分を探す
-  console.error(`[${name}] fetch failed (${failReason}) for ${url}`);
+  console.error(`[${name}] fetch failed (${failReason}) for ${maskUrl(url)}`);
   if (!kv) {
     console.error(`[${name}] no cache binding; treating as empty (previous behaviour)`);
     return { name, text: "", status: "missing" };
