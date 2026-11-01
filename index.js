@@ -2,17 +2,68 @@
 // v1.1 (2026-09): 予約サイトからの取得に失敗したとき、前回成功した分（KV: ICAL_CACHE）を使うようにしました。
 // v1.1.1 (2026-09-26): 取得失敗時のログに iCal URL を丸ごと出さないようにしました（伏せ字）。
 // v1.2 (2026-09-26): 前回と同じ内容なら保管庫（KV）に書き込まないようにしました（KV無料枠の書き込み回数の節約）。
-// v1.3 (2026-09-26): 各サイトの取得状況を、配信する yado.ics の先頭にも X-MERGER-SOURCES 行として書くようにしました（メモ帳で開くだけで確認できる。読み方は X-MERGER-NOTE 行）。
 //   6時間に1回は同じ内容でも書き直して「最後に取得できた時刻」を新しくします。
-// 結合ロジック・出力形式・4つのカレンダーURL（シークレット）は v1.0 と同じです。
-// KV が未設定でも動きます（その場合は v1.0 と同じ「失敗したサイトは空扱い」）。
+// v1.3 (2026-09-26): 各サイトの取得状況を、配信する yado.ics の先頭にも X-MERGER-SOURCES 行として書くようにしました（メモ帳で開くだけで確認できる。読み方は X-MERGER-NOTE 行）。
+// v1.5 (2026-11): 予約サイトごとに中身を分けるようにしました（送り返しの穴をふさぐ）。
+//   全サイトに同じ中身を返すと、Booking.com で手で止めた日や予約が Booking.com 自身に戻り、Booking.com はそれを
+//   「よその止め」に置き換えてエクスポートから外します → 手で止めた日がその後に開き、予約は他のサイトに届かなくなります。
+//   /booking.ics・/airbnb.ics・/agoda.ics は、そのサイト自身の分を抜いた中身を返します。
+//   /（ほかの道も）は従来どおり全部入り（Googleカレンダーで一覧を見る用）。
+//   あわせて、各サイトから取ったものを10分取っておきます（KV: sources:v1）。どの道で何度開いても、取りに行くのは10分に1回まで。
+//   長さは環境変数 MERGED_CACHE_SECONDS で変えられます（0で取っておかない・上限3600秒）。どこから返したかは X-Merger-Cache に出ます。
+// 結合ロジック・4つのカレンダーURL（シークレット）は v1.0 と同じです。
+// KV が未設定でも動きます（その場合は「失敗したサイトは空扱い」・10分の取り置きはこの Worker の手元だけ）。
 
 const CACHE_PREFIX = "ical:";
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // 7日より古い前回分は「stale」と記録（それでも使う）
-const REWRITE_AFTER_MS = 6 * 60 * 60 * 1000; // v1.2: 内容が同じでも、前回の保存から6時間たっていたら書き直す（fetchedAt を新しくするため）
+const REWRITE_AFTER_MS = 6 * 60 * 60 * 1000; // 内容が同じでも、前回の保存から6時間たっていたら書き直す（fetchedAt を新しくするため）
+const SOURCES_KEY = "sources:v1"; // v1.5: 各サイトから取ったものを10分取っておく
+const DEFAULT_MERGED_TTL_MS = 10 * 60 * 1000; // 取ったものを取っておく長さ（10分）
+const VERSION = "1.5";
+let sourcesMemo = null; // { at, results }（同じ Worker が続けて呼ばれた時だけ効く手元の控え）
 
-// v1.1.1 (2026-09-26): ログに iCal URL を丸ごと出さない。URL は「宿の鍵」なので、
-// ログのスクショをAIに貼っても鍵が渡らないよう、ホスト名と末尾4文字だけ残して伏せ字にする。
+// v1.5: 道の名前から「どの予約サイト向けか」を読む。/booking.ics → "booking"。知らない道は null（全部を返す）
+function targetFromPath(pathname, names) {
+  const m = /^\/([a-z]+)\.ics$/i.exec(pathname || "");
+  if (!m) return null;
+  const name = m[1].toLowerCase();
+  return names.includes(name) ? name : null;
+}
+
+function mergedTtlMs(env) {
+  const v = env.MERGED_CACHE_SECONDS;
+  if (v === undefined || v === null || v === "") return DEFAULT_MERGED_TTL_MS;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_MERGED_TTL_MS;
+  return Math.min(n, 3600) * 1000;
+}
+
+function icsResponse(ics, sources, cacheLabel, target) {
+  return new Response(ics, {
+    headers: {
+      "Content-Type": "text/calendar; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${target ? `yado-for-${target}` : "yado"}.ics"`,
+      "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+      "X-Merger-Sources": sources,
+      "X-Merger-Cache": cacheLabel,
+      "X-Merger-For": target || "all",
+    },
+  });
+}
+
+// v1.5: 取ったものから、向け先のサイト自身の分を抜いてまとめる
+function buildFor(results, target) {
+  const blockedDates = new Set();
+  for (const r of results) {
+    if (!r.text || r.name === target) continue;
+    parseAndExtractBlockedDates(r.text, blockedDates);
+  }
+  const blocks = generateMergedBlocks(blockedDates);
+  const sourcesHeader = results.map((r) => `${r.name}=${r.name === target ? "excluded" : r.status}`).join(", ");
+  return { ics: buildIcsFile(blocks, sourcesHeader, target), sources: sourcesHeader };
+}
+
+// ログに iCal URL を丸ごと出さない（URLは「宿の鍵」）。ホスト名と末尾4文字だけ残す。
 function maskUrl(url) {
   try {
     const u = new URL(String(url));
@@ -36,27 +87,49 @@ export default {
       return new Response("設定エラー: カレンダーURLが登録されていません。Cloudflareの環境変数(Variables)を設定してください。", { status: 400 });
     }
 
+    // v1.5: どの予約サイト向けか（そのサイト自身の分は返さない）
+    const target = targetFromPath(new URL(request.url).pathname, sources.map((s) => s.name));
+
+    const ttl = mergedTtlMs(env);
+    const kv = env.ICAL_CACHE;
+    if (ttl > 0) {
+      // v1.5: 10分以内に取ったものがあれば、各サイトへ取りに行かずにそれでまとめる
+      const now = Date.now();
+      if (sourcesMemo && now - sourcesMemo.at < ttl) {
+        const out = buildFor(sourcesMemo.results, target);
+        return icsResponse(out.ics, out.sources, `memory(${formatAge(now - sourcesMemo.at)})`, target);
+      }
+      if (kv) {
+        try {
+          const raw = await kv.get(SOURCES_KEY);
+          if (raw) {
+            const rec = JSON.parse(raw);
+            if (rec && Array.isArray(rec.results) && now - (rec.at || 0) < ttl) {
+              sourcesMemo = rec;
+              const out = buildFor(rec.results, target);
+              return icsResponse(out.ics, out.sources, `kv(${formatAge(now - rec.at)})`, target);
+            }
+          }
+        } catch (e) {
+          console.error("[sources] KV get failed:", e); // 読めなければ、従来どおり各サイトへ取りに行く
+        }
+      }
+    }
+
     try {
       const results = await Promise.all(sources.map((s) => fetchWithFallback(s, env, ctx)));
 
-      const blockedDates = new Set();
-      for (const r of results) {
-        if (!r.text) continue;
-        parseAndExtractBlockedDates(r.text, blockedDates);
+      if (ttl > 0) {
+        const rec = { at: Date.now(), results };
+        sourcesMemo = rec;
+        if (kv) {
+          // KV の書き込みは10分に1回まで（1日最大144回・無料枠1,000回の内）
+          const save = kv.put(SOURCES_KEY, JSON.stringify(rec)).catch((e) => console.error("[sources] KV put failed:", e));
+          if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(save); else await save;
+        }
       }
-
-      const blocks = generateMergedBlocks(blockedDates);
-      const sourcesHeader = results.map((r) => `${r.name}=${r.status}`).join(", ");
-      const responseIcs = buildIcsFile(blocks, sourcesHeader); // v1.3: 取得状況を .ics の先頭にも書く
-
-      return new Response(responseIcs, {
-        headers: {
-          "Content-Type": "text/calendar; charset=utf-8",
-          "Content-Disposition": 'attachment; filename="yado.ics"',
-          "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
-          "X-Merger-Sources": sourcesHeader, // 各サイトの取得状況（live / cached / stale / missing）
-        },
-      });
+      const out = buildFor(results, target); // v1.3: 取得状況を .ics の先頭にも書く
+      return icsResponse(out.ics, out.sources, "fresh", target);
     } catch (e) {
       return new Response(`サーバー内部エラー: ${e instanceof Error ? e.message : e}`, { status: 500 });
     }
@@ -76,7 +149,7 @@ async function fetchWithFallback(source, env, ctx) {
   let liveText = null;
   let failReason = "";
   try {
-    const res = await fetch(url, { headers: { "User-Agent": "Yado-Cal-Merger/1.3" } });
+    const res = await fetch(url, { headers: { "User-Agent": `Yado-Cal-Merger/${VERSION}` } });
     if (!res.ok) {
       failReason = `HTTP ${res.status} ${res.statusText}`;
     } else {
@@ -272,7 +345,7 @@ function foldLine(line) {
   return out.map((s, i) => (i === 0 ? s : " " + s));
 }
 
-function buildIcsFile(blocks, sourcesHeader) {
+function buildIcsFile(blocks, sourcesHeader, target) {
   const lines = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -282,9 +355,10 @@ function buildIcsFile(blocks, sourcesHeader) {
   ];
   // v1.3: 各サイトの取得状況を .ics の先頭にも書く（メモ帳で開くだけで確認できる）。
   // 「X-」で始まる行は iCalendar の独自項目で、予約サイトやカレンダーアプリは読み飛ばす決まり。
-  lines.push("X-MERGER-VERSION:1.3");
+  lines.push(`X-MERGER-VERSION:${VERSION}`);
+  lines.push(`X-MERGER-FOR:${target || "all"}`); // v1.5: どの予約サイト向けか（all=全部・見る用）
   lines.push(...foldLine(`X-MERGER-SOURCES:${sourcesHeader || ""}`));
-  lines.push(...foldLine("X-MERGER-NOTE:各サイトの取得状況です。live=いま取得できた／cached(3h)=3時間前の前回分を使用中（そのサイトが一時的に返事をしていない）／stale(9d)=9日前の前回分を使用中（7日以上取れていない。URLが古くなったかも）／missing=前回分もない"));
+  lines.push(...foldLine("X-MERGER-NOTE:各サイトの取得状況です。live=いま取得できた／cached(3h)=3時間前の前回分を使用中（そのサイトが一時的に返事をしていない）／stale(9d)=9日前の前回分を使用中（7日以上取れていない。URLが古くなったかも）／missing=前回分もない／excluded=この予約サイト向けなので、その社自身の分は入れていない"));
   const nowStr = new Date().toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
   blocks.forEach((block, index) => {
     lines.push("BEGIN:VEVENT");
